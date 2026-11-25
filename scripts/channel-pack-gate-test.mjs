@@ -27,6 +27,10 @@ const shipped = [
   'if (text.trim().length === 0 && toolCalls.length === 0) continue',
   'export { createChannelFetch }',
   'class ChannelNetworkError extends Error {}',
+  'function zcodePlatformKey() { return `${process.platform}-${process.arch}` }',
+  'export function probeBrowserVersion(executable) {}',
+  'this.launcherExited = true',
+  "void this.browserCdp?.send('Browser.close', {}, 2_000)",
 ].join('\n')
 
 // --- counting -------------------------------------------------------------

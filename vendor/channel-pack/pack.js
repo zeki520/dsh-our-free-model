@@ -48082,6 +48082,15 @@ function linuxBrowserCandidates(home) {
     posix.join(home, ".local", "share", "flatpak", "exports", "bin", "org.chromium.Chromium")
   ];
 }
+function probeBrowserVersion(executable) {
+  try {
+    const result = spawnSync(executable, ["--version"], { encoding: "utf8", timeout: 2e3, windowsHide: true });
+    const text = `${result?.stdout ?? ""}${result?.stderr ?? ""}`;
+    if (/Chrome|Chromium|Edge|Edg\//i.test(text)) return text.trim().split("\n")[0].slice(0, 120);
+  } catch {
+  }
+  return void 0;
+}
 function browserCandidates(input = {}) {
   const platform = input.platform ?? process.platform;
   const env = input.env ?? process.env;
@@ -48099,16 +48108,6 @@ function browserCandidates(input = {}) {
     candidates.unshift(override.trim());
   }
   return candidates;
-}
-function findBrowserExecutable() {
-  for (const candidate of browserCandidates()) {
-    try {
-      if (candidate.length === 0 || !isAbsolute(candidate)) continue;
-      if (existsSync4(candidate)) return candidate;
-    } catch {
-    }
-  }
-  return void 0;
 }
 function browserNotFoundMessage(platform = process.platform) {
   if (platform === "darwin") {
@@ -48507,6 +48506,13 @@ var ZcodeCaptchaBrowser = class {
    * 否则「浏览器秒退」要白等满 `readyTimeoutMs`（默认 30 秒）才报错。
    */
   spawnFailure;
+  /**
+   * 启动器进程是否已退出（Windows 交棒特征，见 `launchWithExecutable()` 的
+   * `exit` 监听）。轮询循环据此提前判定「启动器没了、端口也没开」。
+   */
+  launcherExited = false;
+  /** `spawn()` 发起时刻，用于「交棒后 5 秒仍未开端口」的判定。 */
+  spawnedAt = 0;
   /** 浏览器是否已就绪。 */
   get ready() {
     return this.browserCdp !== void 0 && this.browserWs?.readyState === 1;
@@ -48524,13 +48530,57 @@ var ZcodeCaptchaBrowser = class {
     this.starting = task;
     await task;
   }
+  /**
+   * 逐个候选起浏览器，**第一个真正起来的**胜出。
+   *
+   * ## 为什么需要回退（2026-11-25，真实用户环境）
+   *
+   * `findBrowserExecutable()` 只判 `existsSync`，于是「存在但起不来」的
+   * 候选（被安全软件掏空的 stub `chrome.exe`、Edge 自我更新中、权限异常）
+   * 会**吃掉满 `readyTimeoutMs`（默认 30 秒）**才报超时，而不是落到下一个
+   * 可用候选。实测：`%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe`
+   * 是个 967 KB 的 stub（`--version` 只吐 `libpng warning`），CDP 端口永不
+   * 就绪；同机 `msedge.exe` 一切正常却排在它后面 ⇒ 签到恒超时。
+   *
+   * 每个候选失败都会 `kill()` 清场，全失败才抛聚合错误（把每一次的原因
+   * 都列出来，用户才知道该修哪个浏览器）。
+   */
   async launch() {
-    const executable = this.options.executablePath ?? findBrowserExecutable();
-    if (executable === void 0) {
-      throw new Error(
-        "zcode: \u627E\u4E0D\u5230\u53EF\u7528\u7684\u6D4F\u89C8\u5668\uFF08\u7528\u4E8E\u4EA7\u51FA\u963F\u91CC\u4E91 captcha\uFF09\u3002" + browserNotFoundMessage()
-      );
+    const explicit = this.options.executablePath;
+    const candidates = explicit !== void 0 ? [explicit] : browserCandidates();
+    const tried = [];
+    let lastError;
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string" || candidate.length === 0) continue;
+      if (!isAbsolute(candidate) || !existsSync4(candidate)) continue;
+      try {
+        await this.launchWithExecutable(candidate);
+        return;
+      } catch (error) {
+        lastError = error;
+        tried.push(`${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+        this.kill();
+      }
     }
+    if (lastError !== void 0) {
+      const message = lastError instanceof Error ? lastError.message : String(lastError);
+      throw new Error(`${message}
+\u5DF2\u5C1D\u8BD5 ${tried.length} \u4E2A\u6D4F\u89C8\u5668\uFF1A
+  ${tried.join("\n  ")}`);
+    }
+    throw new Error(
+      "zcode: \u627E\u4E0D\u5230\u53EF\u7528\u7684\u6D4F\u89C8\u5668\uFF08\u7528\u4E8E\u4EA7\u51FA\u963F\u91CC\u4E91 captcha\uFF09\u3002" + browserNotFoundMessage()
+    );
+  }
+  /** 用**指定**可执行文件起一次浏览器（候选链的单个分支）。 */
+  async launchWithExecutable(executable) {
+    const probedVersion = probeBrowserVersion(executable);
+    if (probedVersion === void 0 && this.options.executablePath === void 0) {
+      throw new Error(`zcode: ${executable} \u672A\u901A\u8FC7 --version \u9884\u7B5B\uFF08\u65E0 Chrome/Chromium/Edge \u7248\u672C\u4E32\uFF0C\u7591\u4F3C stub \u5B89\u88C5\uFF09`);
+    }
+    this.log?.(
+      `[channel-pack] zcode captcha \u6D4F\u89C8\u5668\uFF1A${executable}${probedVersion === void 0 ? "\uFF08\u5DF2\u8DF3\u8FC7\u9884\u7B5B\uFF09" : `\uFF08${probedVersion}\uFF09`}`
+    );
     if (isEdgeExecutable(executable)) {
       this.log?.(
         "[channel-pack] zcode captcha \u672A\u68C0\u6D4B\u5230 Chrome/Chromium\uFF0C\u6539\u7528\u7CFB\u7EDF Edge\uFF08msedge.exe\uFF09\u4EA7\u51FA \u2014\u2014 \u82E5 Edge \u5F02\u5E38\u5BFC\u81F4 captcha \u5931\u8D25\uFF0C\u53EF\u5B89\u88C5 Chrome/Chromium \u6216\u7528 ZCODE_CHROME_PATH \u6307\u5B9A\u5176\u5B83\u6D4F\u89C8\u5668\u3002"
@@ -48569,6 +48619,8 @@ var ZcodeCaptchaBrowser = class {
       detached: process.platform !== "win32"
     });
     const child = this.child;
+    this.spawnedAt = Date.now();
+    this.launcherExited = false;
     child.once("error", (error) => {
       this.spawnFailure = new Error(
         `zcode: \u6D4F\u89C8\u5668\u65E0\u6CD5\u542F\u52A8\uFF08${executable}\uFF09\uFF1A${error.message}\u3002\u53EF\u5B89\u88C5 Chrome/Chromium\uFF0C\u6216\u7528 ZCODE_CHROME_PATH \u6307\u5B9A\u5176\u5B83 chromium \u5185\u6838\u6D4F\u89C8\u5668\u3002`
@@ -48577,6 +48629,8 @@ var ZcodeCaptchaBrowser = class {
     child.once("exit", (code, signal) => {
       if (this.child !== child) return;
       this.child = void 0;
+      this.launcherExited = true;
+      if (code === 0 && signal === null) return;
       const how = signal !== null && signal !== void 0 ? `signal=${signal}` : `code=${String(code)}`;
       this.spawnFailure ??= new Error(
         `zcode: \u6D4F\u89C8\u5668\u8FDB\u7A0B\u5F02\u5E38\u9000\u51FA\uFF08${executable}\uFF0C${how}\uFF09\u3002\u8BF7\u91CD\u8BD5\uFF0C\u6216\u7528 ZCODE_CHROME_PATH \u6307\u5B9A\u5176\u5B83 chromium \u5185\u6838\u6D4F\u89C8\u5668\u3002`
@@ -48603,6 +48657,9 @@ var ZcodeCaptchaBrowser = class {
           }
         }
       } catch {
+      }
+      if (this.launcherExited && Date.now() - this.spawnedAt > 5e3) {
+        throw new Error(`zcode: \u6D4F\u89C8\u5668 ${executable} \u542F\u52A8\u5668\u5DF2\u9000\u51FA\u4F46 5s \u5185\u672A\u5F00\u653E\u8C03\u8BD5\u7AEF\u53E3\uFF08\u7591\u4F3C stub / \u65E0\u6548\u5B89\u88C5\uFF09`);
       }
       await sleep3(300);
     }
@@ -48948,6 +49005,11 @@ var ZcodeCaptchaBrowser = class {
    * Windows 用 `taskkill /T /F`（`/T` = 含子进程树）。
    */
   kill() {
+    try {
+      void this.browserCdp?.send("Browser.close", {}, 2e3).catch(() => {
+      });
+    } catch {
+    }
     try {
       this.reusablePage?.cdp.close();
     } catch {
@@ -50082,6 +50144,9 @@ var ZCODE_BILLING_PREVIEW_URL = `${ZCODE_ORIGIN2}/api/v1/zcode-plan/billing/prev
 var ZCODE_BILLING_CLAIM_URL = `${ZCODE_ORIGIN2}/api/v1/zcode-plan/billing/claim`;
 var ZCODE_EVENT_REPORT_URL = `${ZCODE_ORIGIN2}/api/v1/event/report`;
 var ZCODE_CLIENT_CONFIGS_URL = `${ZCODE_ORIGIN2}/api/v1/client/configs`;
+function zcodePlatformKey() {
+  return `${process.platform}-${process.arch}`;
+}
 function buildZcodeHeaders(credential, options = {}) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
   const headers = {
@@ -50092,7 +50157,7 @@ function buildZcodeHeaders(credential, options = {}) {
     "X-Client-Language": "zh-CN",
     "X-Client-Timezone": "Asia/Shanghai",
     "X-Device-Mid": credential.device_mid,
-    "X-Platform": "win32",
+    "X-Platform": zcodePlatformKey(),
     "X-Os-Category": "windows",
     "anthropic-version": "2023-06-01"
   };
@@ -50175,8 +50240,8 @@ async function fetchClaimablePlans(credential, fetchImpl) {
     const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
     const response = await fetchWithTimeout(
       fetchImpl,
-      `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`,
-      { method: "GET", headers: buildZcodeHeaders(credential, { json: false }) },
+      `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(zcodePlatformKey())}`,
+      { method: "GET", headers: buildZcodeHeaders(credential, { json: false, authorization: `Bearer ${credential.zcode_jwt}` }) },
       15e3
     );
     if (!response.ok) return [];
@@ -50208,7 +50273,7 @@ async function reportZcodeActivation(credential, fetchImpl = fetch) {
         body: JSON.stringify({
           event,
           device_mid: credential.device_mid,
-          platform: "win32",
+          platform: zcodePlatformKey(),
           app_version: appVersion
         })
       }, 2e4);
@@ -50218,10 +50283,14 @@ async function reportZcodeActivation(credential, fetchImpl = fetch) {
 }
 async function fetchZcodeClaimablePlans(credential, fetchImpl = fetch) {
   const appVersion = credential.app_version ?? ZCODE_APP_VERSION_FALLBACK;
-  const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=win32`;
+  const url = `${ZCODE_BILLING_PREVIEW_URL}?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(zcodePlatformKey())}`;
   const response = await fetchWithTimeout(fetchImpl, url, {
     method: "GET",
-    headers: buildZcodeHeaders(credential, { json: false })
+    /**
+     * ★ 必须带 `Authorization`（2026-11-25 实测）：不带一律 401、body 为空，
+     * 于是下面的 `!response.ok` 把「没登录」静默折叠成「今天没有可领额度」。
+     */
+    headers: buildZcodeHeaders(credential, { json: false, authorization: `Bearer ${credential.zcode_jwt}` })
   }, 25e3);
   if (!response.ok) return [];
   let parsed;
